@@ -1,352 +1,382 @@
-import streamlit as st
-import os
-from pathlib import Path
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_ollama import OllamaEmbeddings, OllamaLLM
-from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
 import tempfile
-import shutil
+from pathlib import Path
 
-# Page configuration
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    TextLoader,
+    Docx2txtLoader,
+)
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+load_dotenv()
+# Import your configured LLM and embeddings
+# Example:
+# from config import llm, embeddings
+
+PERSIST_DIRECTORY = "./database"
+SIMILARITY_THRESHOLD = 0.70
+embeddings=OllamaEmbeddings(model="nomic-embed-text:latest")
+llm=ChatOllama(model="llama3:8b")
+
+# --------------------------------------------------
+# Page Configuration
+# --------------------------------------------------
 st.set_page_config(
-    page_title="Legal Document Analyzer",
-    page_icon="⚖️",
+    page_title="Legal Document Assistant",
+    page_icon="📄",
     layout="wide",
-    initial_sidebar_state="expanded"
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main {
-        padding: 0rem 0rem;
-    }
-    .stTabs [data-baseweb="tab-list"] button {
-        font-size: 1.1em;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.title("📄 Legal Document Assistant")
+st.write("Upload a legal document from the sidebar, generate a summary, or ask questions about it.")
 
-# Initialize session state
-if "vector_db" not in st.session_state:
-    st.session_state.vector_db = None
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = None
-if "llm" not in st.session_state:
-    st.session_state.llm = None
 
-@st.cache_resource
-def load_embeddings():
-    """Load embeddings model"""
-    try:
-        return OllamaEmbeddings(model="nomic-embed-text:latest")
-    except Exception as e:
-        st.error(f"Error loading embeddings: {e}")
-        return None
+# --------------------------------------------------
+# Session State
+# --------------------------------------------------
+if "db" not in st.session_state:
+    st.session_state.db = None
 
-@st.cache_resource
-def load_llm():
-    """Load LLM model"""
-    try:
-        return OllamaLLM(model="llama3:8b")
-    except Exception as e:
-        st.error(f"Error loading LLM: {e}")
-        return None
+if "documents" not in st.session_state:
+    st.session_state.documents = None
 
-def initialize_vector_db():
-    """Initialize or load existing vector database"""
-    embeddings = load_embeddings()
-    if embeddings is None:
-        return None
-    
-    db_path = "./database"
-    try:
-        db = Chroma(
-            persist_directory=db_path,
-            embedding_function=embeddings
-        )
-        return db
-    except Exception as e:
-        st.error(f"Error initializing vector database: {e}")
-        return None
 
-def process_pdf(pdf_file):
-    """Process uploaded PDF file"""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(pdf_file.read())
-        tmp_path = tmp_file.name
-    
-    try:
-        loader = PyPDFLoader(tmp_path)
-        documents = loader.load()
-        return documents
-    except Exception as e:
-        st.error(f"Error processing PDF: {e}")
-        return None
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+# --------------------------------------------------
+# Helper Functions
+# --------------------------------------------------
+def load_document(file_path):
+    extension = Path(file_path).suffix.lower()
 
-def add_documents_to_db(documents, file_name):
-    """Add documents to vector database"""
-    embeddings = load_embeddings()
-    if embeddings is None:
-        st.error("Embeddings not available")
-        return False
-    
-    try:
-        # Split documents
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=150
-        )
-        split_docs = splitter.split_documents(documents)
-        
-        # Add metadata
-        for doc in split_docs:
-            doc.metadata["source_file"] = file_name
-        
-        db_path = "./database"
-        
-        # Create or add to existing database
-        db = Chroma.from_documents(
-            split_docs,
-            embeddings,
-            persist_directory=db_path,
-        )
-        
-        st.session_state.vector_db = db
-        return True
-    except Exception as e:
-        st.error(f"Error adding documents to database: {e}")
-        return False
+    if extension == ".pdf":
+        loader = PyPDFLoader(file_path)
 
-def summarize_document(text, llm_model=None):
-    """Summarize document using LLM"""
-    if llm_model is None:
-        llm_model = load_llm()
-    
-    if llm_model is None:
-        return "Error: LLM not available"
-    
-    try:
-        prompt_template = ChatPromptTemplate.from_template(
-            """You are a legal document analyzer. Provide a concise and clear summary of the following legal document.
-            
-Document:
-{document_text}
+    elif extension == ".docx":
+        loader = Docx2txtLoader(file_path)
 
-Summary:"""
-        )
-        
-        chain = prompt_template | llm_model
-        response = chain.invoke({"document_text": text[:4000]})  # Limit input length
-        return response
-    except Exception as e:
-        return f"Error generating summary: {e}"
+    elif extension == ".txt":
+        loader = TextLoader(file_path)
 
-def query_documents(query_text, db, k=5):
-    """Query documents from vector database"""
-    try:
-        results = db.similarity_search(query_text, k=k)
-        return results
-    except Exception as e:
-        st.error(f"Error querying documents: {e}")
-        return []
-
-# Header
-st.markdown("# ⚖️ Legal Document Analyzer")
-st.markdown("---")
-
-# Sidebar for PDF upload and configuration
-with st.sidebar:
-    st.header("📁 Document Management")
-    
-    uploaded_file = st.file_uploader(
-        "Upload a PDF document",
-        type="pdf",
-        help="Upload a legal document (PDF format)"
-    )
-    
-    if uploaded_file:
-        st.info(f"Selected file: {uploaded_file.name}")
-        
-        if st.button("📤 Process & Add to Database", key="process_pdf"):
-            with st.spinner("Processing PDF..."):
-                documents = process_pdf(uploaded_file)
-                if documents:
-                    st.success(f"Loaded {len(documents)} pages")
-                    
-                    if add_documents_to_db(documents, uploaded_file.name):
-                        st.success(f"✅ {uploaded_file.name} added to database!")
-                        # Save to data folder
-                        data_folder = Path("./data")
-                        data_folder.mkdir(exist_ok=True)
-                        with open(data_folder / uploaded_file.name, "wb") as f:
-                            f.write(uploaded_file.getbuffer())
-    
-    st.divider()
-    
-    # Model configuration
-    st.header("⚙️ Configuration")
-    
-    model_choice = st.selectbox(
-        "LLM Model",
-        ["mistral:latest", "llama3:8b", "neural-chat:latest"],
-        help="Select the LLM model to use"
-    )
-    
-    chunk_size = st.slider(
-        "Chunk Size",
-        min_value=500,
-        max_value=2000,
-        value=1000,
-        step=100,
-        help="Size of text chunks for processing"
-    )
-
-# Main content area with tabs
-tab1, tab2, tab3 = st.tabs(["📄 Summarize", "🔍 Query", "💡 Ask"])
-
-# Tab 1: Summarize
-with tab1:
-    st.header("Document Summary")
-    st.markdown("Upload a PDF or select from database to generate a summary")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        if uploaded_file:
-            st.subheader(f"Summarizing: {uploaded_file.name}")
-            
-            if st.button("Generate Summary", key="gen_summary"):
-                with st.spinner("Generating summary..."):
-                    documents = process_pdf(uploaded_file)
-                    if documents:
-                        # Combine document text
-                        full_text = "\n".join([doc.page_content for doc in documents])
-                        summary = summarize_document(full_text, load_llm())
-                        
-                        st.subheader("Summary:")
-                        st.write(summary)
-                        
-                        # Download summary
-                        st.download_button(
-                            label="📥 Download Summary",
-                            data=summary,
-                            file_name=f"summary_{uploaded_file.name.replace('.pdf', '.txt')}",
-                            mime="text/plain"
-                        )
-        else:
-            st.info("👆 Upload a PDF document to generate a summary")
-
-# Tab 2: Query Database
-with tab2:
-    st.header("Query Documents")
-    st.markdown("Search through your document database")
-    
-    # Initialize database if not done
-    if st.session_state.vector_db is None:
-        st.session_state.vector_db = initialize_vector_db()
-    
-    if st.session_state.vector_db is not None:
-        query_input = st.text_input(
-            "Enter your query:",
-            placeholder="e.g., What are the payment terms?"
-        )
-        
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            k = st.slider("Number of results", min_value=1, max_value=10, value=5)
-        
-        if query_input:
-            if st.button("🔍 Search", key="search_btn"):
-                with st.spinner("Searching..."):
-                    results = query_documents(
-                        query_input,
-                        st.session_state.vector_db,
-                        k=k
-                    )
-                    
-                    if results:
-                        st.success(f"Found {len(results)} relevant sections")
-                        
-                        for i, result in enumerate(results, 1):
-                            with st.expander(f"Result {i} - {result.metadata.get('source_file', 'Unknown')}"):
-                                st.write(result.page_content)
-                                st.caption(f"Page: {result.metadata.get('page', 'N/A')}")
-                    else:
-                        st.warning("No results found")
     else:
-        st.warning("⚠️ No documents in database. Upload a PDF first!")
+        raise ValueError("Unsupported file type.")
 
-# Tab 3: AI Assistant
-with tab3:
-    st.header("Legal Assistant")
-    st.markdown("Ask questions about your documents with AI-powered responses")
-    
-    # Initialize database if not done
-    if st.session_state.vector_db is None:
-        st.session_state.vector_db = initialize_vector_db()
-    
-    if st.session_state.vector_db is not None:
-        question = st.text_area(
-            "Ask a question:",
-            placeholder="e.g., What are the main obligations of each party?",
-            height=100
-        )
-        
-        if st.button("💭 Get Answer", key="ask_btn"):
-            if question:
-                with st.spinner("Searching and analyzing..."):
-                    # Search for relevant documents
-                    relevant_docs = query_documents(question, st.session_state.vector_db, k=3)
-                    
-                    if relevant_docs:
-                        # Combine context
-                        context = "\n\n".join([doc.page_content for doc in relevant_docs])
-                        
-                        # Create prompt with context
-                        prompt_template = ChatPromptTemplate.from_template(
-                            """You are an expert legal assistant. Based on the provided document excerpts, answer the following question clearly and accurately.
+    return loader.load()
 
-Document Context:
+
+def build_vectorstore(uploaded_file):
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=Path(uploaded_file.name).suffix,
+    ) as tmp:
+        tmp.write(uploaded_file.getbuffer())
+        temp_path = tmp.name
+
+    documents = load_document(temp_path)
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+
+    chunks = splitter.split_documents(documents)
+
+    db = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=PERSIST_DIRECTORY,
+    )
+
+    return db, documents
+
+
+def summarize_document(documents):
+
+    text = "\n\n".join(doc.page_content for doc in documents)
+
+    prompt = f"""
+'''You are an expert Legal Document Analysis AI specializing in reviewing, interpreting, and summarizing legal documents.
+
+Your responsibilities include:
+- Analyzing contracts, agreements, policies, legal notices, regulations, licenses, NDAs, employment agreements, court filings, and other legal documents.
+- Answering questions ONLY using the provided document context.
+- Identifying relevant clauses and explaining them in plain English.
+- Producing accurate, objective, and well-structured responses.
+
+Strict Rules
+
+1. Use ONLY the information contained in the provided document context.
+
+2. Never invent:
+   - clauses
+   - obligations
+   - dates
+   - legal definitions
+   - parties
+   - penalties
+   - rights
+   - legal conclusions
+
+3. If the answer cannot be found in the provided context, respond exactly:
+
+   "The provided document does not contain enough information to answer this question."
+
+4. Never claim something exists unless it appears in the document.
+
+5. Quote the relevant portion of the document whenever possible before explaining it.
+
+6. Distinguish clearly between:
+   - Direct document content
+   - Interpretation
+   - General legal knowledge
+
+7. If legal knowledge outside the document would be required, state:
+
+   "This would require legal interpretation beyond the provided document."
+
+8. Never provide legal advice.
+
+Instead say:
+
+   "This is an informational analysis of the document and should not be considered legal advice."
+
+Response Style
+
+Be concise, precise, and professional.
+
+Use markdown headings when appropriate.
+
+For every answer follow this structure whenever possible:
+
+### Answer
+Direct answer.
+
+### Supporting Evidence
+Quote or summarize the relevant document section.
+
+### Explanation
+Explain the clause in plain language.
+
+### Confidence
+High / Medium / Low
+
+Confidence Rules
+
+High:
+- Explicitly stated in the document.
+
+Medium:
+- Inferred from multiple clauses.
+
+Low:
+- Ambiguous wording or incomplete context.
+
+When asked to summarize a document, include:
+
+# Document Summary
+
+## Purpose
+
+## Parties Involved
+
+## Effective Date
+
+## Term / Duration
+
+## Key Obligations
+
+## Rights
+
+## Payment Terms
+
+## Confidentiality
+
+## Intellectual Property
+
+## Liability
+
+## Indemnification
+
+## Termination
+
+## Governing Law
+
+## Important Deadlines
+
+## Risks and Unusual Clauses
+
+## Missing Information
+
+When comparing two documents:
+
+- List similarities.
+- List differences.
+- Highlight conflicting clauses.
+- Identify clauses present in one but absent in the other.
+
+When identifying risks:
+
+Categorize each risk as:
+- High
+- Medium
+- Low
+
+Provide:
+- Risk
+- Relevant Clause
+- Reason
+- Potential Impact
+
+Formatting Rules
+
+- Use bullet lists where appropriate.
+- Keep explanations simple.
+- Do not speculate.
+- Do not hallucinate.
+- If uncertain, explicitly say so.
+
+Remember:
+Accuracy is more important than completeness.
+Never answer beyond what is supported by the provided document.''
+Document:
+{text}
+"""
+
+    return llm.invoke(prompt).content
+
+
+def ask_question(db, query):
+
+    results = db.similarity_search_with_score(query, k=5)
+
+    if not results:
+        return llm.invoke(query).content
+
+    best_doc, best_distance = results[0]
+    best_similarity = 1 - best_distance
+
+    context = "\n\n".join(
+        doc.page_content for doc, _ in results
+    )
+
+    # -------------------------
+    # High Similarity
+    # -------------------------
+    if best_similarity >= SIMILARITY_THRESHOLD:
+
+        prompt = f"""
+Context:
 {context}
 
-Question: {question}
+Question:
+{query}
+"""
 
-Answer:"""
-                        )
-                        
-                        llm = load_llm()
-                        chain = prompt_template | llm
-                        
-                        response = chain.invoke({
-                            "context": context,
-                            "question": question
-                        })
-                        
-                        st.subheader("Answer:")
-                        st.write(response)
-                        
-                        with st.expander("📚 Source Documents"):
-                            for i, doc in enumerate(relevant_docs, 1):
-                                st.caption(f"Source {i}: {doc.metadata.get('source_file', 'Unknown')}")
-                                st.text(doc.page_content[:500] + "...")
-                    else:
-                        st.warning("No relevant documents found to answer your question.")
-            else:
-                st.warning("Please enter a question")
-    else:
-        st.warning("⚠️ No documents in database. Upload a PDF first!")
+        return llm.invoke(prompt).content
 
-# Footer
+    # -------------------------
+    # Low Similarity
+    # -------------------------
+    rag_prompt = f"""
+You must answer ONLY using the context below.
+
+If the answer cannot be found, reply exactly:
+
+The provided document does not contain enough information to answer this question.
+
+Context:
+{context}
+
+Question:
+{query}
+"""
+
+    response = llm.invoke(rag_prompt).content
+
+    if (
+        "The provided document does not contain enough information"
+        in response
+    ):
+        return llm.invoke(query).content
+
+    return response
+
+
+# --------------------------------------------------
+# Sidebar
+# --------------------------------------------------
+with st.sidebar:
+
+    st.header("📂 Upload Document")
+
+    uploaded_file = st.file_uploader(
+        "Choose a PDF, DOCX, or TXT file",
+        type=["pdf", "docx", "txt"],
+    )
+
+    if uploaded_file:
+
+        with st.spinner("Processing document..."):
+
+            db, docs = build_vectorstore(uploaded_file)
+
+            st.session_state.db = db
+            st.session_state.documents = docs
+
+        st.success("✅ Document indexed successfully.")
+
+
+# --------------------------------------------------
+# Main Page
+# --------------------------------------------------
+
+# Summary
+st.header("📑 Document Summary")
+
+if st.session_state.documents:
+
+    if st.button("Generate Summary"):
+
+        with st.spinner("Generating summary..."):
+
+            summary = summarize_document(
+                st.session_state.documents
+            )
+
+        st.markdown(summary)
+
+else:
+    st.info("Upload a document from the sidebar.")
+
+
 st.divider()
-st.markdown("""
-<div style="text-align: center; color: gray; margin-top: 30px;">
-    <p>Legal Document Analyzer v1.0 | Powered by LangChain & Ollama</p>
-    <p>⚠️ Disclaimer: This tool is for informational purposes. Consult a legal professional for important decisions.</p>
-</div>
-""", unsafe_allow_html=True)
+
+# Question Answering
+st.header("💬 Ask Questions")
+
+question = st.text_input(
+    "Enter your question about the document"
+)
+
+if st.button("Ask"):
+
+    if st.session_state.db is None:
+
+        st.warning("Please upload a document first.")
+
+    elif not question.strip():
+
+        st.warning("Please enter a question.")
+
+    else:
+
+        with st.spinner("Searching document..."):
+
+            answer = ask_question(
+                st.session_state.db,
+                question,
+            )
+
+        st.subheader("Answer")
+        st.write(answer)

@@ -3,7 +3,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 
-doc=DirectoryLoader("./data", glob="**/*.pdf", loader_cls=PyPDFLoader) #type:ignore
+doc=DirectoryLoader("./data", glob="**/*.PDF" or "**/*.pdf", loader_cls=PyPDFLoader) #type:ignore
 loader=doc.load()
 
 splitter=RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
