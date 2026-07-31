@@ -14,7 +14,7 @@ from langchain_mistralai import (
     ChatMistralAI,
     MistralAIEmbeddings,
 )
-
+import os
 load_dotenv()
 
 PERSIST_DIRECTORY = "./database"
@@ -22,10 +22,12 @@ SIMILARITY_THRESHOLD = 0.70
 
 embeddings = MistralAIEmbeddings(
     model="mistral-embed"
+    api_key=os.getenv("MISTRAL_API_KEY")
 )
 
 llm = ChatMistralAI(
     model="mistral-small-latest",
+    api_key=os.getenv("MISTRAL_API_KEY")
     temperature=0,
 )
 # --------------------------------------------------
