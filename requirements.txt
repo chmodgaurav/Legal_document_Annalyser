@@ -3,7 +3,6 @@ langchain-community
 langchain-core
 langchain-text-splitters
 langchain-chroma
-langchain-ollama
 pymupdf
 pypdf
 streamlit
@@ -15,5 +14,5 @@ flake8
 pylint
 isort
 ipython
-langchain-google-genai
+langchain-mistralai
 ipdb

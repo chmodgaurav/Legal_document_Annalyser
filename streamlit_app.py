@@ -1,6 +1,5 @@
 import tempfile
 from pathlib import Path
-
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -10,17 +9,25 @@ from langchain_community.document_loaders import (
     Docx2txtLoader,
 )
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings, ChatOllama
+from dotenv import load_dotenv
+from langchain_mistralai import (
+    ChatMistralAI,
+    MistralAIEmbeddings,
+)
+
 load_dotenv()
-# Import your configured LLM and embeddings
-# Example:
-# from config import llm, embeddings
 
 PERSIST_DIRECTORY = "./database"
 SIMILARITY_THRESHOLD = 0.70
-embeddings=OllamaEmbeddings(model="nomic-embed-text:latest")
-llm=ChatOllama(model="llama3:8b")
 
+embeddings = MistralAIEmbeddings(
+    model="mistral-embed"
+)
+
+llm = ChatMistralAI(
+    model="mistral-small-latest",
+    temperature=0,
+)
 # --------------------------------------------------
 # Page Configuration
 # --------------------------------------------------
