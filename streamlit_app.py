@@ -1,382 +1,714 @@
-import tempfile
-from pathlib import Path
+import os
+import hashlib
+from typing import List
 
 import streamlit as st
 from dotenv import load_dotenv
+
+from openai import OpenAI
+from pinecone import Pinecone
+
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import (
-    PyPDFLoader,
-    TextLoader,
-    Docx2txtLoader,
-)
-from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings, ChatOllama
+
+from pypdf import PdfReader
+from docx import Document as DocxDocument
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
 load_dotenv()
-# Import your configured LLM and embeddings
-# Example:
-# from config import llm, embeddings
 
-PERSIST_DIRECTORY = "./database"
-SIMILARITY_THRESHOLD = 0.70
-embeddings=OllamaEmbeddings(model="nomic-embed-text:latest")
-llm=ChatOllama(model="llama3:8b")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-# --------------------------------------------------
+PINECONE_INDEX_NAME = os.getenv(
+    "PINECONE_INDEX_NAME",
+    "legal-documents",
+)
+
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+)
+
+EMBEDDING_DIMENSIONS = int(
+    os.getenv("EMBEDDING_DIMENSIONS", "1024")
+)
+
+CHAT_MODEL = os.getenv(
+    "CHAT_MODEL",
+    "google/gemini-2.5-flash",
+)
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+if not OPENROUTER_API_KEY:
+    st.error("OPENROUTER_API_KEY is missing from .env")
+    st.stop()
+
+if not PINECONE_API_KEY:
+    st.error("PINECONE_API_KEY is missing from .env")
+    st.stop()
+
+
+# ============================================================
 # Page Configuration
-# --------------------------------------------------
+# ============================================================
+
 st.set_page_config(
-    page_title="Legal Document Assistant",
-    page_icon="📄",
+    page_title="Legal AI Assistant",
+    page_icon="⚖️",
     layout="wide",
 )
 
-st.title("📄 Legal Document Assistant")
-st.write("Upload a legal document from the sidebar, generate a summary, or ask questions about it.")
+
+# ============================================================
+# Custom Embedding Class
+# ============================================================
+
+class OpenRouterEmbeddings(Embeddings):
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = EMBEDDING_MODEL,
+        dimensions: int = EMBEDDING_DIMENSIONS,
+    ):
+        self.client = OpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
+
+        self.model = model
+        self.dimensions = dimensions
+
+    def embed_documents(
+        self,
+        texts: List[str],
+    ) -> List[List[float]]:
+
+        if not texts:
+            return []
+
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=texts,
+            dimensions=self.dimensions,
+            encoding_format="float",
+        )
+
+        return [
+            item.embedding
+            for item in response.data
+        ]
+
+    def embed_query(
+        self,
+        text: str,
+    ) -> List[float]:
+
+        response = self.client.embeddings.create(
+            model=self.model,
+            input=text,
+            dimensions=self.dimensions,
+            encoding_format="float",
+        )
+
+        return response.data[0].embedding
 
 
-# --------------------------------------------------
-# Session State
-# --------------------------------------------------
-if "db" not in st.session_state:
-    st.session_state.db = None
+# ============================================================
+# Clients
+# ============================================================
 
-if "documents" not in st.session_state:
-    st.session_state.documents = None
+@st.cache_resource
+def get_openrouter_client():
 
-
-# --------------------------------------------------
-# Helper Functions
-# --------------------------------------------------
-def load_document(file_path):
-    extension = Path(file_path).suffix.lower()
-
-    if extension == ".pdf":
-        loader = PyPDFLoader(file_path)
-
-    elif extension == ".docx":
-        loader = Docx2txtLoader(file_path)
-
-    elif extension == ".txt":
-        loader = TextLoader(file_path)
-
-    else:
-        raise ValueError("Unsupported file type.")
-
-    return loader.load()
+    return OpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+    )
 
 
-def build_vectorstore(uploaded_file):
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=Path(uploaded_file.name).suffix,
-    ) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        temp_path = tmp.name
+@st.cache_resource
+def get_embeddings():
 
-    documents = load_document(temp_path)
+    return OpenRouterEmbeddings(
+        api_key=OPENROUTER_API_KEY,
+    )
+
+
+@st.cache_resource
+def get_vector_store():
+
+    pc = Pinecone(
+        api_key=PINECONE_API_KEY,
+    )
+
+    index = pc.Index(
+        PINECONE_INDEX_NAME
+    )
+
+    return PineconeVectorStore(
+        index=index,
+        embedding=get_embeddings(),
+    )
+
+
+client = get_openrouter_client()
+vector_store = get_vector_store()
+
+
+# ============================================================
+# Document Extraction
+# ============================================================
+
+def extract_pdf(file) -> str:
+
+    reader = PdfReader(file)
+
+    pages = []
+
+    for page in reader.pages:
+
+        text = page.extract_text()
+
+        if text:
+            pages.append(text)
+
+    return "\n\n".join(pages)
+
+
+def extract_docx(file) -> str:
+
+    doc = DocxDocument(file)
+
+    paragraphs = [
+        paragraph.text
+        for paragraph in doc.paragraphs
+        if paragraph.text.strip()
+    ]
+
+    return "\n\n".join(paragraphs)
+
+
+def extract_txt(file) -> str:
+
+    return file.getvalue().decode(
+        "utf-8",
+        errors="ignore",
+    )
+
+
+def extract_text(file) -> str:
+
+    extension = file.name.lower().split(".")[-1]
+
+    if extension == "pdf":
+        return extract_pdf(file)
+
+    if extension == "docx":
+        return extract_docx(file)
+
+    if extension == "txt":
+        return extract_txt(file)
+
+    raise ValueError(
+        f"Unsupported file type: .{extension}"
+    )
+
+
+# ============================================================
+# Hash File
+# ============================================================
+
+def get_file_hash(file) -> str:
+
+    return hashlib.sha256(
+        file.getvalue()
+    ).hexdigest()
+
+
+# ============================================================
+# Chunking
+# ============================================================
+
+def create_chunks(
+    text: str,
+    file_name: str,
+    file_hash: str,
+) -> List[Document]:
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
+        chunk_size=1200,
         chunk_overlap=200,
+        separators=[
+            "\n\n",
+            "\n",
+            ". ",
+            " ",
+            "",
+        ],
     )
 
-    chunks = splitter.split_documents(documents)
+    chunks = splitter.split_text(text)
 
-    db = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=PERSIST_DIRECTORY,
+    documents = []
+
+    for index, chunk in enumerate(chunks):
+
+        if not chunk.strip():
+            continue
+
+        documents.append(
+            Document(
+                page_content=chunk,
+                metadata={
+                    "source": file_name,
+                    "file_hash": file_hash,
+                    "chunk_id": index,
+                },
+            )
+        )
+
+    return documents
+
+
+# ============================================================
+# Document Ingestion
+# ============================================================
+
+def ingest_document(file):
+
+    file_hash = get_file_hash(file)
+
+    text = extract_text(file)
+
+    if not text.strip():
+
+        raise ValueError(
+            "No readable text was found in the document."
+        )
+
+    documents = create_chunks(
+        text=text,
+        file_name=file.name,
+        file_hash=file_hash,
     )
 
-    return db, documents
+    if not documents:
+
+        raise ValueError(
+            "Document produced zero chunks."
+        )
+
+    # Deterministic IDs.
+    # Uploading the same document again generates
+    # the same IDs instead of creating random duplicates.
+    ids = []
+
+    for document in documents:
+
+        chunk_hash = hashlib.sha256(
+            document.page_content.encode("utf-8")
+        ).hexdigest()
+
+        vector_id = (
+            f"{file_hash}-{chunk_hash}"
+        )
+
+        ids.append(vector_id)
+
+    vector_store.add_documents(
+        documents=documents,
+        ids=ids,
+    )
+
+    return {
+        "file_name": file.name,
+        "chunks": len(documents),
+        "file_hash": file_hash,
+    }
 
 
-def summarize_document(documents):
+# ============================================================
+# Retrieve Documents
+# ============================================================
 
-    text = "\n\n".join(doc.page_content for doc in documents)
+def retrieve_documents(
+    query: str,
+    k: int = 5,
+):
 
-    prompt = f"""
-'''You are an expert Legal Document Analysis AI specializing in reviewing, interpreting, and summarizing legal documents.
+    results = vector_store.similarity_search_with_score(
+        query=query,
+        k=k,
+    )
 
-Your responsibilities include:
-- Analyzing contracts, agreements, policies, legal notices, regulations, licenses, NDAs, employment agreements, court filings, and other legal documents.
-- Answering questions ONLY using the provided document context.
-- Identifying relevant clauses and explaining them in plain English.
-- Producing accurate, objective, and well-structured responses.
-
-Strict Rules
-
-1. Use ONLY the information contained in the provided document context.
-
-2. Never invent:
-   - clauses
-   - obligations
-   - dates
-   - legal definitions
-   - parties
-   - penalties
-   - rights
-   - legal conclusions
-
-3. If the answer cannot be found in the provided context, respond exactly:
-
-   "The provided document does not contain enough information to answer this question."
-
-4. Never claim something exists unless it appears in the document.
-
-5. Quote the relevant portion of the document whenever possible before explaining it.
-
-6. Distinguish clearly between:
-   - Direct document content
-   - Interpretation
-   - General legal knowledge
-
-7. If legal knowledge outside the document would be required, state:
-
-   "This would require legal interpretation beyond the provided document."
-
-8. Never provide legal advice.
-
-Instead say:
-
-   "This is an informational analysis of the document and should not be considered legal advice."
-
-Response Style
-
-Be concise, precise, and professional.
-
-Use markdown headings when appropriate.
-
-For every answer follow this structure whenever possible:
-
-### Answer
-Direct answer.
-
-### Supporting Evidence
-Quote or summarize the relevant document section.
-
-### Explanation
-Explain the clause in plain language.
-
-### Confidence
-High / Medium / Low
-
-Confidence Rules
-
-High:
-- Explicitly stated in the document.
-
-Medium:
-- Inferred from multiple clauses.
-
-Low:
-- Ambiguous wording or incomplete context.
-
-When asked to summarize a document, include:
-
-# Document Summary
-
-## Purpose
-
-## Parties Involved
-
-## Effective Date
-
-## Term / Duration
-
-## Key Obligations
-
-## Rights
-
-## Payment Terms
-
-## Confidentiality
-
-## Intellectual Property
-
-## Liability
-
-## Indemnification
-
-## Termination
-
-## Governing Law
-
-## Important Deadlines
-
-## Risks and Unusual Clauses
-
-## Missing Information
-
-When comparing two documents:
-
-- List similarities.
-- List differences.
-- Highlight conflicting clauses.
-- Identify clauses present in one but absent in the other.
-
-When identifying risks:
-
-Categorize each risk as:
-- High
-- Medium
-- Low
-
-Provide:
-- Risk
-- Relevant Clause
-- Reason
-- Potential Impact
-
-Formatting Rules
-
-- Use bullet lists where appropriate.
-- Keep explanations simple.
-- Do not speculate.
-- Do not hallucinate.
-- If uncertain, explicitly say so.
-
-Remember:
-Accuracy is more important than completeness.
-Never answer beyond what is supported by the provided document.''
-Document:
-{text}
-"""
-
-    return llm.invoke(prompt).content
+    return results
 
 
-def ask_question(db, query):
+# ============================================================
+# Generate Answer
+# ============================================================
 
-    results = db.similarity_search_with_score(query, k=5)
+def generate_answer(
+    query: str,
+    results,
+    chat_history,
+):
 
     if not results:
-        return llm.invoke(query).content
 
-    best_doc, best_distance = results[0]
-    best_similarity = 1 - best_distance
+        return (
+            "I don't know based on the provided documents.",
+            [],
+        )
+
+    # Build context
+    context_parts = []
+
+    for i, (doc, score) in enumerate(
+        results,
+        start=1,
+    ):
+
+        source = doc.metadata.get(
+            "source",
+            "Unknown",
+        )
+
+        context_parts.append(
+            f"""
+SOURCE {i}
+File: {source}
+Similarity Score: {score:.4f}
+
+Content:
+{doc.page_content}
+"""
+        )
 
     context = "\n\n".join(
-        doc.page_content for doc, _ in results
+        context_parts
     )
 
-    # -------------------------
-    # High Similarity
-    # -------------------------
-    if best_similarity >= SIMILARITY_THRESHOLD:
+    # Keep conversation reasonably small
+    previous_messages = ""
 
-        prompt = f"""
-Context:
+    for message in chat_history[-6:]:
+
+        previous_messages += (
+            f"{message['role'].upper()}: "
+            f"{message['content']}\n"
+        )
+
+    prompt = f"""
+You are an expert legal AI assistant.
+
+Your job is to answer questions using ONLY
+the information contained in the provided documents.
+
+Rules:
+
+1. Do not use outside knowledge.
+2. Do not invent legal facts.
+3. If the answer is not supported by the documents,
+   respond exactly:
+
+"I don't know based on the provided documents."
+
+4. When possible, mention the source filename.
+5. Give a clear and concise answer.
+6. Treat previous conversation as context,
+   but documents are the source of truth.
+
+Previous conversation:
+{previous_messages}
+
+Retrieved documents:
 {context}
 
-Question:
+User question:
 {query}
+
+Answer:
 """
 
-        return llm.invoke(prompt).content
+    response = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a document-grounded "
+                    "legal AI assistant."
+                ),
+            },
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        temperature=0,
+        max_tokens=800,
+    )
 
-    # -------------------------
-    # Low Similarity
-    # -------------------------
-    rag_prompt = f"""
-You must answer ONLY using the context below.
+    answer = response.choices[0].message.content
 
-If the answer cannot be found, reply exactly:
-
-The provided document does not contain enough information to answer this question.
-
-Context:
-{context}
-
-Question:
-{query}
-"""
-
-    response = llm.invoke(rag_prompt).content
-
-    if (
-        "The provided document does not contain enough information"
-        in response
-    ):
-        return llm.invoke(query).content
-
-    return response
+    return answer, results
 
 
-# --------------------------------------------------
+# ============================================================
+# Session State
+# ============================================================
+
+if "messages" not in st.session_state:
+
+    st.session_state.messages = []
+
+
+# ============================================================
 # Sidebar
-# --------------------------------------------------
+# ============================================================
+
 with st.sidebar:
 
-    st.header("📂 Upload Document")
+    st.title("Document Management")
 
-    uploaded_file = st.file_uploader(
-        "Choose a PDF, DOCX, or TXT file",
-        type=["pdf", "docx", "txt"],
+    st.markdown(
+        "Upload legal documents and add them "
+        "to the Pinecone knowledge base."
     )
 
-    if uploaded_file:
+    uploaded_files = st.file_uploader(
+        "Upload documents",
+        type=[
+            "pdf",
+            "docx",
+            "txt",
+        ],
+        accept_multiple_files=True,
+    )
 
-        with st.spinner("Processing document..."):
+    if uploaded_files:
 
-            db, docs = build_vectorstore(uploaded_file)
+        if st.button(
+            "Process Documents",
+            type="primary",
+            use_container_width=True,
+        ):
 
-            st.session_state.db = db
-            st.session_state.documents = docs
+            progress = st.progress(0)
 
-        st.success("✅ Document indexed successfully.")
+            total = len(uploaded_files)
+
+            for index, file in enumerate(
+                uploaded_files
+            ):
+
+                try:
+
+                    result = ingest_document(file)
+
+                    st.success(
+                        f"Added {result['file_name']} "
+                        f"({result['chunks']} chunks)"
+                    )
+
+                except Exception as e:
+
+                    st.error(
+                        f"Failed to process "
+                        f"{file.name}: {e}"
+                    )
+
+                progress.progress(
+                    (index + 1) / total
+                )
+
+    st.divider()
+
+    st.subheader("Retrieval")
+
+    retrieval_k = st.slider(
+        "Documents to retrieve",
+        min_value=1,
+        max_value=10,
+        value=5,
+    )
+
+    st.divider()
+
+    if st.button(
+        "Clear Conversation",
+        use_container_width=True,
+    ):
+
+        st.session_state.messages = []
+
+        st.rerun()
 
 
-# --------------------------------------------------
-# Main Page
-# --------------------------------------------------
+# ============================================================
+# Main UI
+# ============================================================
 
-# Summary
-st.header("📑 Document Summary")
+st.title("⚖️ Legal AI Assistant")
 
-if st.session_state.documents:
-
-    if st.button("Generate Summary"):
-
-        with st.spinner("Generating summary..."):
-
-            summary = summarize_document(
-                st.session_state.documents
-            )
-
-        st.markdown(summary)
-
-else:
-    st.info("Upload a document from the sidebar.")
-
-
-st.divider()
-
-# Question Answering
-st.header("💬 Ask Questions")
-
-question = st.text_input(
-    "Enter your question about the document"
+st.caption(
+    "Chat with your uploaded legal documents "
+    "using OpenRouter + Pinecone + RAG."
 )
 
-if st.button("Ask"):
 
-    if st.session_state.db is None:
+# ============================================================
+# Display Chat History
+# ============================================================
 
-        st.warning("Please upload a document first.")
+for message in st.session_state.messages:
 
-    elif not question.strip():
+    with st.chat_message(
+        message["role"]
+    ):
 
-        st.warning("Please enter a question.")
+        st.markdown(
+            message["content"]
+        )
 
-    else:
+        # Display sources for assistant messages
+        if (
+            message["role"] == "assistant"
+            and message.get("sources")
+        ):
 
-        with st.spinner("Searching document..."):
+            with st.expander(
+                "View retrieved sources"
+            ):
 
-            answer = ask_question(
-                st.session_state.db,
-                question,
-            )
+                for source in message["sources"]:
 
-        st.subheader("Answer")
-        st.write(answer)
+                    st.markdown(
+                        f"""
+**File:** {source["file"]}
+
+**Score:** {source["score"]:.4f}
+
+**Content:**
+
+{source["content"]}
+"""
+                    )
+
+
+# ============================================================
+# Chat Input
+# ============================================================
+
+query = st.chat_input(
+    "Ask a question about your legal documents..."
+)
+
+
+if query:
+
+    # User message
+    st.session_state.messages.append(
+        {
+            "role": "user",
+            "content": query,
+        }
+    )
+
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    with st.chat_message("assistant"):
+
+        with st.spinner(
+            "Searching documents..."
+        ):
+
+            try:
+
+                results = retrieve_documents(
+                    query=query,
+                    k=retrieval_k,
+                )
+
+                answer, sources = generate_answer(
+                    query=query,
+                    results=results,
+                    chat_history=st.session_state.messages[:-1],
+                )
+
+                st.markdown(answer)
+
+                # Prepare source data
+                source_data = []
+
+                for doc, score in results:
+
+                    source_data.append(
+                        {
+                            "file": doc.metadata.get(
+                                "source",
+                                "Unknown",
+                            ),
+                            "score": score,
+                            "content": doc.page_content,
+                        }
+                    )
+
+                # Show sources
+                if source_data:
+
+                    with st.expander(
+                        "View retrieved sources"
+                    ):
+
+                        for source in source_data:
+
+                            st.markdown(
+                                f"""
+**File:** {source["file"]}
+
+**Similarity Score:** {source["score"]:.4f}
+
+{source["content"]}
+"""
+                            )
+
+                # Save assistant response
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": source_data,
+                    }
+                )
+
+            except Exception as e:
+
+                error_message = (
+                    f"An error occurred: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+                st.error(error_message)
+
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": error_message,
+                        "sources": [],
+                    }
+                )

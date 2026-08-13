@@ -2,7 +2,8 @@ langchain
 langchain-community
 langchain-core
 langchain-text-splitters
-langchain-chroma
+langchain-pinecone
+pinecone
 pymupdf
 pypdf
 streamlit
@@ -16,3 +17,4 @@ isort
 ipython
 langchain-mistralai
 ipdb
+python-docx
